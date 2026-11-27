@@ -9,9 +9,333 @@
 <body>
     <header>
         <h1>Week 5 documentation</h1>
-        <p><a href="{{ url_for('index') }}">Back to the chat</a> ·
-           <a href="https://github.com/Keilwii/linux-week5">GitHub repository</a></p>
+        <p>CI/CD pipeline and a self-hosted LLM chat, on my Hetzner server A (dev-kalle).</p>
+        <ul>
+            <li>Chat: <a href="{{ url_for('index') }}">http://46.62.229.94/viikko5/</a></li>
+            <li>Repository: <a href="https://github.com/Keilwii/linux-week5">github.com/Keilwii/linux-week5</a>
+                (<a href="https://github.com/Keilwii/linux-week5/actions">Actions tab</a>)</li>
+            <li>Running version: <a href="{{ url_for('health') }}">/viikko5/health</a> →
+                <code>{{ revision }}</code></li>
+        </ul>
     </header>
-    <section><p>Coming soon.</p></section>
+
+    <section>
+        <h2>Request path</h2>
+<pre><code>browser ──HTTP 80──▶ nginx (the existing week-1 site, one extra include line)
+                       ├── /viikko2/  /viikko3/  /    earlier weeks, unchanged
+                       ├── /viikko5/static/  ──▶ files from /opt/viikko5/app/static
+                       └── /viikko5/  ──unix socket /run/viikko5/gunicorn.sock──▶
+                                        gunicorn + Flask (user viikko5)
+                                           ├──HTTP──▶ Ollama 127.0.0.1:11434 (llama3.2:1b)
+                                           └──socket─▶ MariaDB, database viikko5
+
+GitHub Actions ──SSH 22──▶ deploy@A  (forced command: rsync or "deploy &lt;sha&gt;", nothing else)</code></pre>
+        <p>
+            Nginx strips <code>/viikko5</code> and sends it in <code>X-Forwarded-Prefix</code>. Flask's
+            <code>ProxyFix</code> turns that into the script root, so <code>url_for()</code> makes links like
+            <code>/viikko5/static/chat.js</code> and the page tells the JavaScript its base path in
+            <code>&lt;body data-base="/viikko5"&gt;</code>. Nothing has the path hard-coded except the nginx snippet.
+        </p>
+        <p>
+            The reply is streamed: Ollama sends one JSON line per token, Flask passes each line on as soon
+            as it arrives, nginx has <code>proxy_buffering off</code> for this location, and the browser reads
+            the stream with <code>fetch()</code> and adds the tokens to the message.
+        </p>
+        <p>
+            Every browser gets a random id in an HttpOnly cookie <code>chat_session</code> (path
+            <code>/viikko5/</code>, no expiry, so it lasts until the browser is closed). Messages are saved with
+            that id, and the page loads the history from MariaDB on every load. Another browser or a private
+            window has no cookie, so it gets a new id and an empty conversation. "Start a new conversation"
+            just gives a new id.
+        </p>
+    </section>
+
+    <section>
+        <h2>Pipeline</h2>
+        <p>File: <code>.github/workflows/ci-cd.yml</code>.</p>
+        <h3>On every push and pull request (job "Lint and tests")</h3>
+        <ul>
+            <li><code>ruff check .</code></li>
+            <li><code>pytest -v</code>, 17 tests. Ollama is replaced with a fake <code>requests.post</code> that returns
+                ready NDJSON lines, and the database functions with an in-memory fake, so the runner needs neither.</li>
+            <li><code>bash -n</code> for every script in <code>scripts/</code>.</li>
+        </ul>
+        <h3>On a push to main, only if the test job passed (job "Deploy to server A")</h3>
+        <ol>
+            <li>Write the private key and the server's host key from the secrets <code>SSH_PRIVATE_KEY</code> and
+                <code>SSH_KNOWN_HOSTS</code> (<code>StrictHostKeyChecking yes</code>, so a different server is refused).</li>
+            <li><code>rsync --delete</code> the code to <code>/opt/viikko5/app</code> as user <code>deploy</code>.</li>
+            <li><code>ssh deploy@A "deploy $GITHUB_SHA"</code> runs <code>scripts/deploy.sh</code>: installs
+                <code>requirements.txt</code> into <code>/opt/viikko5/venv</code>, writes the SHA to <code>REVISION</code>,
+                then <code>sudo viikko5-install</code> which
+                applies <code>deploy/sql/schema.sql</code>,
+                copies the nginx snippet and runs <code>nginx -t</code> (the old snippet is put back if the test fails),
+                copies <code>viikko5.service</code>, <code>daemon-reload</code>,
+                restarts <strong>only</strong> <code>viikko5</code> and reloads nginx.</li>
+            <li><code>deploy.sh</code> waits until <code>http://127.0.0.1/viikko5/health</code> returns the new SHA,
+                otherwise it prints <code>systemctl status</code> and exits with an error.</li>
+            <li>The workflow then checks from outside: <code>/viikko5/health</code> must equal <code>github.sha</code>,
+                the chat page, <code>chat.js</code> and <code>/docs</code> must load, and so must
+                <code>/</code>, <code>/viikko2/</code> and <code>/viikko3/</code> from earlier weeks.
+                Any failure makes the run red.</li>
+        </ol>
+        <p>
+            The app reads <code>REVISION</code> once when it starts. If it read the file on every request, the old
+            process would already show the new SHA after the rsync, and the check would pass even if the restart failed.
+        </p>
+    </section>
+
+    <section>
+        <h2>Users, permissions and secrets</h2>
+        <div class="table-container">
+        <table>
+            <thead><tr><th>Who</th><th>What it is for</th><th>Rights</th></tr></thead>
+            <tbody>
+                <tr><td>Linux <code>viikko5</code></td><td>runs gunicorn</td>
+                    <td>system user, shell <code>/usr/sbin/nologin</code>, no home. Can read the code and the env file, can't write the code.</td></tr>
+                <tr><td>Linux <code>deploy</code></td><td>GitHub Actions logs in as this</td>
+                    <td>password locked, key login only. The key has <code>restrict,command="/usr/local/sbin/viikko5-ssh-gate"</code>:
+                        it can only rsync into <code>/opt/viikko5/app</code> (rrsync, write only) or run <code>deploy &lt;sha&gt;</code>, no shell.
+                        Owns <code>/opt/viikko5/app</code> and the venv. sudo is allowed for exactly one command without arguments:
+                        <code>/usr/local/sbin/viikko5-install</code>.</td></tr>
+                <tr><td>Linux <code>www-data</code></td><td>nginx</td><td>member of group <code>viikko5</code> so it can open the socket</td></tr>
+                <tr><td>Linux <code>ollama</code></td><td>Ollama server (made by its installer)</td><td>own system user</td></tr>
+                <tr><td>DB <code>viikko5@localhost</code></td><td>the app</td><td><code>SELECT, INSERT</code> on <code>viikko5.*</code> only</td></tr>
+                <tr><td>DB <code>viikko5_schema@localhost</code></td><td>applies <code>schema.sql</code> on deploy</td>
+                    <td><code>SELECT, CREATE, ALTER, INDEX</code> on <code>viikko5.*</code> only</td></tr>
+            </tbody>
+        </table>
+        </div>
+        <ul>
+            <li><code>/etc/viikko5/viikko5.env</code>: DB password and settings, <code>root:viikko5 640</code>, read by systemd's <code>EnvironmentFile=</code>.</li>
+            <li><code>/etc/viikko5/schema.cnf</code>: password of the schema user, <code>root:root 600</code>.</li>
+            <li>Both passwords were made on the server with <code>openssl rand</code> by <code>server-setup.sh</code>. They are not in git.</li>
+            <li>GitHub Actions secrets: <code>SSH_PRIVATE_KEY</code> (a key pair made only for this, not my own key, the local copy was
+                deleted after saving it) and <code>SSH_KNOWN_HOSTS</code> (from my own <code>known_hosts</code>, not from ssh-keyscan).</li>
+            <li><code>/usr/local/sbin/viikko5-install</code> and <code>viikko5-ssh-gate</code> are <code>root:root 755</code> copies made by
+                the setup script. Deploys do not change them.</li>
+        </ul>
+        <p>
+            <strong>GitHub Actions and SSH:</strong> the runners come from changing IP addresses, so I can't limit port 22 to them.
+            Port 22 was already open to everyone in ufw (Hetzner, no extra cloud firewall). What protects it: password login and root
+            login are off, fail2ban is running, and the deploy key can't get a shell. The weak point is that anyone who can push to
+            main can change the nginx snippet and the systemd unit that root installs. <code>viikko5-install</code> refuses a unit that is
+            not <code>User=viikko5</code> / <code>Group=viikko5</code> or uses <code>+</code>/<code>!</code> exec prefixes, but the repository
+            is still trusted, so only I have write access to it.
+        </p>
+    </section>
+
+    <section>
+        <h2>How /viikko5/ was added to nginx</h2>
+        <p>
+            The existing site <code>/etc/nginx/sites-available/week-1</code> got one line, next to the week 2 one:
+        </p>
+<pre><code>	include snippets/viikko2.conf;
+	include snippets/viikko5.conf;</code></pre>
+        <p>
+            The setup script saved a copy to <code>/root/week-1.before-viikko5</code> first, ran <code>nginx -t</code> and would have
+            restored it on failure. The snippet (<code>deploy/nginx/viikko5.conf</code> in the repo) has only
+            <code>location</code> blocks: <code>= /viikko5</code> redirects to <code>/viikko5/</code>,
+            <code>^~ /viikko5/static/</code> is an alias to the files on disk, and <code>^~ /viikko5/</code> proxies to the socket.
+            Deploys only replace the snippet, never the site file. The Unix socket can't clash with week 2's port 8002.
+        </p>
+    </section>
+
+    <section>
+        <h2>Model, memory and disk</h2>
+        <p>
+            Before installing: 7.6 GiB RAM (6.9 GiB available), no swap, 4 vCPUs, no GPU, 70 GB free disk. I picked
+            <code>llama3.2:1b</code> (1.3 GB on disk, about 1.5 GB in memory). It fits easily, so no swap or resize was needed, and it
+            writes better English than the 0.5B models. Replies take about 3 to 4 seconds on the CPU. Ollama has
+            <code>OLLAMA_KEEP_ALIVE=24h</code> so the model stays loaded and the first message isn't slow.
+        </p>
+<pre><code>$ ollama list
+NAME           ID              SIZE      MODIFIED
+llama3.2:1b    baf6a787fdff    1.3 GB    24 minutes ago
+
+$ ollama ps
+NAME           ID              SIZE      PROCESSOR    CONTEXT    RUNNER      UNTIL
+llama3.2:1b    baf6a787fdff    1.5 GB    100% CPU     4096       llamacpp    24 hours from now
+
+$ free -h        (model loaded)
+               total        used        free      shared  buff/cache   available
+Mem:           7.6Gi       2.2Gi       575Mi       4.8Mi       5.1Gi       5.4Gi
+Swap:             0B          0B          0B
+
+$ df -h /
+Filesystem      Size  Used Avail Use% Mounted on
+/dev/sda1        75G  6.2G   66G   9% /</code></pre>
+    </section>
+
+    <section>
+        <h2>Is the chat database replicated to server B?</h2>
+        <p>
+            No. In week 4 B was set up with <code>replicate_wild_do_table=week2.%</code>, so it only applies changes to the
+            week 2 counter. The <code>viikko5</code> database, its users (created with <code>sql_log_bin=0</code>) and its
+            messages are not applied on B. The table and inserts do go into A's binlog and travel to B over SSL, but B's
+            filter drops them. I left it that way on purpose: B's page only needs the counter, chat messages are users' private
+            text that shouldn't be copied to a second public server, and the week 4 replica didn't need changes.
+            Replication was checked after the first deploy and after the reboot: both threads <code>Yes</code>, no errors.
+        </p>
+    </section>
+
+    <section>
+        <h2>Test results (2026-11-27)</h2>
+        <div class="table-container">
+        <table>
+            <thead><tr><th>Test</th><th>Result</th></tr></thead>
+            <tbody>
+                <tr><td>/viikko5/ is public and the local model replies</td>
+                    <td class="ok">OK: "Hi! My name is Kalle. What is Linux in one sentence?" got an answer in 3.6 s, then
+                        "What is my name?" → "Your name is Kalle." (earlier messages are sent to the model).</td></tr>
+                <tr><td>Reload keeps the conversation</td><td class="ok">OK: after reloading, the page showed the same 4 messages from MariaDB.</td></tr>
+                <tr><td>New browser session is empty</td><td class="ok">OK: a request without the cookie got a new id and 0 messages.
+                    The DB had 6 messages in 2 conversations.</td></tr>
+                <tr><td>Model and app server not reachable from the internet</td>
+                    <td class="ok">OK: <code>nc -z 46.62.229.94 11434</code> from my laptop: closed. Ollama listens on
+                        <code>127.0.0.1:11434</code>, its runner on <code>127.0.0.1:35243</code>, gunicorn only on a Unix
+                        socket (no TCP port at all). ufw allows only 22, 80, 443 and 3306 from B.</td></tr>
+                <tr><td>Push to main deploys automatically, /health shows the new SHA</td>
+                    <td class="ok">OK: every push to main deployed except the one with the failing test, for example
+                        <a href="https://github.com/Keilwii/linux-week5/actions/runs/46003987709">ce5cfc4</a>,
+                        <a href="https://github.com/Keilwii/linux-week5/actions/runs/46004479178">7681d30</a>,
+                        <a href="https://github.com/Keilwii/linux-week5/actions/runs/46004686809">79ed47a</a>,
+                        <a href="https://github.com/Keilwii/linux-week5/actions/runs/46004861260">b76faad</a>.
+                        After each one <code>/viikko5/health</code> returned the full SHA of that commit.</td></tr>
+                <tr><td>A failing test is not deployed</td>
+                    <td class="ok">OK: commit 3639b37 changed the script tag to <code>app.js</code>.
+                        <code>test_links_use_forwarded_prefix</code> failed, "Deploy to server A" was <strong>skipped</strong> and
+                        health still showed 7681d30.
+                        <a href="https://github.com/Keilwii/linux-week5/actions/runs/46004597725">Failed run</a>.
+                        Fixed in 79ed47a, which deployed.</td></tr>
+                <tr><td>Reboot</td><td class="ok">OK: <code>sudo reboot</code> at 13:25 UTC (also loaded the new 7.0.0-44 kernel).
+                    Afterwards <code>viikko5</code>, <code>ollama</code>, nginx, MariaDB, the week 2 app and cron were active without
+                    me doing anything, health returned the same SHA and the chat replied in 3.5 s with the old history still shown.
+                    B's replication reconnected by itself on its next 60 s retry.</td></tr>
+                <tr><td>Earlier weeks after deploys</td><td class="ok">OK: <code>/</code>, <code>/viikko2/</code>, <code>/viikko3/</code>
+                    return 200, checked by every deploy run. B's <code>/viikko4/</code> also works.</td></tr>
+            </tbody>
+        </table>
+        </div>
+    </section>
+
+    <section>
+        <h2>Evidence from the server</h2>
+        <p class="note">Collected with <code>scripts/evidence.sh</code> just before the reboot. Password hashes are replaced. Nothing else was a secret.</p>
+<pre><code>$ systemctl status viikko5 --no-pager -n 3
+● viikko5.service - Week 5 LLM chat (Flask + Gunicorn)
+     Loaded: loaded (/etc/systemd/system/viikko5.service; enabled; preset: enabled)
+     Active: active (running) since Fri 2026-11-27 13:11:12 UTC; 14min ago
+   Main PID: 726203 (gunicorn)
+      Tasks: 5 (limit: 8047)
+     Memory: 71M (peak: 71.5M)
+     CGroup: /system.slice/viikko5.service
+             ├─726203 /opt/viikko5/venv/bin/python3 /opt/viikko5/venv/bin/gunicorn --workers 2 --worker-class gthread --threads 8 --timeout 300 --bind unix:/run/viikko5/gunicorn.sock --umask 007 --access-logfile - app:app
+             ├─726216 ... (worker)
+             └─726217 ... (worker)
+Nov 27 13:11:14 dev-kalle gunicorn[726216]: 127.0.0.1 - - "GET /health HTTP/1.1" 200 41 "-" "curl/8.18.0"
+Nov 27 13:11:15 dev-kalle gunicorn[726216]: 51.8.190.55 - - "GET / HTTP/1.1" 200 2050 "-" "curl/8.18.0"
+Nov 27 13:11:15 dev-kalle gunicorn[726217]: 51.8.190.55 - - "GET /docs HTTP/1.1" 200 524 "-" "curl/8.18.0"
+
+$ systemctl show viikko5 -p User -p Group
+User=viikko5
+Group=viikko5
+
+$ ls -ld /opt/viikko5 /opt/viikko5/app /opt/viikko5/venv
+drwxr-xr-x 4 root   root   4096 Nov 27 12:58 /opt/viikko5
+drwxr-xr-x 7 deploy deploy 4096 Nov 27 13:11 /opt/viikko5/app
+drwxr-xr-x 5 deploy deploy 4096 Nov 27 13:05 /opt/viikko5/venv
+
+$ ls -l /opt/viikko5/app
+-rw-r--r-- 1 deploy deploy 3562 Nov 27 13:11 README.md
+-rw-rw-r-- 1 deploy deploy   41 Nov 27 13:11 REVISION
+-rw-r--r-- 1 deploy deploy 5555 Nov 27 13:11 app.py
+-rw-r--r-- 1 deploy deploy 1321 Nov 27 13:11 db.py
+drwxr-xr-x 5 deploy deploy 4096 Nov 27 13:05 deploy
+-rw-r--r-- 1 deploy deploy  191 Nov 27 13:11 pyproject.toml
+-rw-r--r-- 1 deploy deploy   40 Nov 27 13:11 requirements-dev.txt
+-rw-r--r-- 1 deploy deploy   61 Nov 27 13:11 requirements.txt
+drwxr-xr-x 2 deploy deploy 4096 Nov 27 13:11 scripts
+drwxr-xr-x 2 deploy deploy 4096 Nov 27 13:11 static
+drwxr-xr-x 2 deploy deploy 4096 Nov 27 13:11 templates
+drwxr-xr-x 2 deploy deploy 4096 Nov 27 13:11 tests
+
+$ ls -ld /etc/viikko5 &amp;&amp; ls -l /etc/viikko5/
+drwxr-x--- 2 root viikko5 4096 Nov 27 12:58 /etc/viikko5
+-rw------- 1 root root    124 Nov 27 12:58 schema.cnf
+-rw-r----- 1 root viikko5 270 Nov 27 12:58 viikko5.env
+
+$ ls -ld /run/viikko5 &amp;&amp; ls -l /run/viikko5/
+drwxr-x--- 2 viikko5 viikko5 60 Nov 27 13:11 /run/viikko5
+srwxrwx--- 1 viikko5 viikko5 0 Nov 27 13:11 gunicorn.sock
+
+$ id viikko5; id deploy; id www-data
+uid=999(viikko5) gid=983(viikko5) groups=983(viikko5)
+uid=1001(deploy) gid=1001(deploy) groups=1001(deploy)
+uid=33(www-data) gid=33(www-data) groups=33(www-data),983(viikko5)
+
+MariaDB [(none)]> SHOW GRANTS FOR 'viikko5'@'localhost';
+GRANT USAGE ON *.* TO `viikko5`@`localhost` IDENTIFIED BY PASSWORD '&lt;hash removed&gt;'
+GRANT SELECT, INSERT ON `viikko5`.* TO `viikko5`@`localhost`
+
+MariaDB [(none)]> SHOW GRANTS FOR 'viikko5_schema'@'localhost';
+GRANT USAGE ON *.* TO `viikko5_schema`@`localhost` IDENTIFIED BY PASSWORD '&lt;hash removed&gt;'
+GRANT SELECT, CREATE, INDEX, ALTER ON `viikko5`.* TO `viikko5_schema`@`localhost`
+
+$ cat /etc/sudoers.d/viikko5-deploy
+deploy ALL=(root) NOPASSWD: /usr/local/sbin/viikko5-install ""
+
+$ cut -d" " -f1 /home/deploy/.ssh/authorized_keys
+restrict,command="/usr/local/sbin/viikko5-ssh-gate"
+
+$ sudo ss -ltnp
+State  Local Address:Port  Process
+LISTEN 127.0.0.53%lo:53    users:(("systemd-resolve",pid=529,fd=17))
+LISTEN       0.0.0.0:80    users:(("nginx",pid=726211,fd=5),...)
+LISTEN       0.0.0.0:22    users:(("sshd",pid=1125,fd=3),("systemd",pid=1,fd=199))
+LISTEN     127.0.0.1:35243 users:(("llama-server",pid=724811,fd=3))
+LISTEN       0.0.0.0:3306  users:(("mariadbd",pid=299708,fd=30))     &lt;- ufw: only from B (week 4)
+LISTEN     127.0.0.1:11434 users:(("ollama",pid=722406,fd=4))
+LISTEN     127.0.0.1:8002  users:(("python3",pid=706522,fd=3))       &lt;- week 2 app
+LISTEN    127.0.0.54:53    users:(("systemd-resolve",pid=529,fd=19))
+LISTEN          [::]:80    users:(("nginx",...))
+LISTEN          [::]:22    users:(("sshd",...))
+(gunicorn has no TCP port, only /run/viikko5/gunicorn.sock)
+
+$ sudo ufw status
+To                         Action      From
+OpenSSH                    ALLOW       Anywhere
+80/tcp                     ALLOW       Anywhere
+443/tcp                    ALLOW       Anywhere
+22/tcp                     ALLOW       Anywhere
+3306/tcp                   ALLOW       95.216.189.103
+
+$ systemctl is-enabled viikko5 ollama nginx mariadb
+enabled
+enabled
+enabled
+enabled</code></pre>
+    </section>
+
+    <section>
+        <h2>Problem I solved</h2>
+        <p>
+            The first <code>systemctl status viikko5</code> showed
+            <code>[ERROR] Control server error: [Errno 13] Permission denied: '/home/viikko5'</code>.
+            The chat still worked, so I almost missed it. Gunicorn 27 (the version pip installed) opens a control socket in
+            <code>~/.gunicorn/</code> by default, but my service user has no home directory on purpose, and
+            <code>ProtectHome=true</code> would block it anyway. I don't need the control interface, so I added
+            <code>--no-control-socket</code> to <code>ExecStart</code> in <code>deploy/systemd/viikko5.service</code> and pushed.
+            The pipeline installed the new unit, ran <code>daemon-reload</code> and restarted only viikko5, and the error is gone.
+            It also showed that the systemd config really is deployed from the repository.
+        </p>
+        <p>
+            Something I learned: my first version of <code>/health</code> read the <code>REVISION</code> file on every request.
+            That would make the health check lie, because the file is written before the restart, so a broken new version
+            would still look deployed. Now the value is read once at startup.
+        </p>
+    </section>
+
+    <footer class="note">Running commit <code>{{ revision[:7] }}</code></footer>
 </body>
 </html>
