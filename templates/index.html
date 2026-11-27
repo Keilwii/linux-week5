@@ -8,7 +8,7 @@
 </head>
 <body data-base="{{ request.script_root }}">
     <header>
-        <h1>Chat with a local model</h1>
+        <h1>Chat with llama on dev-kalle</h1>
         <p>Week 5: CI/CD pipeline and a self-hosted LLM chat</p>
         <p>
             The model is <code>{{ model }}</code> and it runs with Ollama on this same Hetzner
@@ -47,6 +47,6 @@
     </section>
 
     <footer class="note">Running commit <code>{{ revision[:7] }}</code>, <a href="{{ url_for('health') }}">health</a></footer>
-    <script src="{{ url_for('static', filename='chat.js') }}"></script>
+    <script src="{{ url_for('static', filename='app.js') }}"></script>
 </body>
 </html>
