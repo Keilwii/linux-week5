@@ -1,0 +1,98 @@
+name: CI/CD
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+# one deploy at a time, a newer push waits for the running one
+concurrency:
+  group: ci-cd-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Lint and tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"   # same as server A
+          cache: pip
+          cache-dependency-path: requirements*.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Ruff
+        run: ruff check .
+
+      - name: Pytest (Ollama and MariaDB are faked)
+        run: pytest -v
+
+      - name: Shell syntax
+        run: for f in scripts/*.sh; do bash -n "$f"; done
+
+  deploy:
+    name: Deploy to server A
+    needs: test          # a failing test means no deploy
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    env:
+      HOST: 46.62.229.94
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: SSH key and known_hosts from secrets
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.SSH_KNOWN_HOSTS }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          cat > ~/.ssh/config <<CONF
+          Host server-a
+            HostName $HOST
+            User deploy
+            IdentityFile ~/.ssh/deploy_key
+            IdentitiesOnly yes
+            StrictHostKeyChecking yes
+          CONF
+
+      - name: Copy the code (rsync)
+        run: |
+          rsync -rlz --delete --chmod=D755,F644 \
+            --exclude .git --exclude .github --exclude REVISION \
+            --exclude __pycache__ --exclude .pytest_cache --exclude .ruff_cache \
+            ./ server-a:
+
+      - name: Install and restart (scripts/deploy.sh on the server)
+        run: ssh server-a "deploy ${{ github.sha }}"
+
+      - name: Check the public URLs
+        run: |
+          set -x
+          running=$(curl -fsS --retry 5 --retry-delay 3 "http://$HOST/viikko5/health")
+          if [ "$running" != "${{ github.sha }}" ]; then
+            echo "::error::health shows $running, expected ${{ github.sha }}"
+            exit 1
+          fi
+          curl -fsS "http://$HOST/viikko5/" | grep -q 'id="chat-form"'
+          curl -fsS -o /dev/null "http://$HOST/viikko5/static/chat.js"
+          curl -fsS -o /dev/null "http://$HOST/viikko5/docs"
+          # earlier weeks must still work
+          curl -fsS -o /dev/null "http://$HOST/"
+          curl -fsS -o /dev/null "http://$HOST/viikko2/"
+          curl -fsS -o /dev/null "http://$HOST/viikko3/"
+          echo "deployed ${{ github.sha }}"
+
+      - name: Remove the key
+        if: always()
+        run: rm -f ~/.ssh/deploy_key
