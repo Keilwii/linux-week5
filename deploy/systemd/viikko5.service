@@ -14,7 +14,7 @@ RuntimeDirectory=viikko5
 RuntimeDirectoryMode=0750
 ExecStart=/opt/viikko5/venv/bin/gunicorn \
     --workers 2 --worker-class gthread --threads 8 \
-    --timeout 300 \
+    --timeout 300 --no-control-socket \
     --bind unix:/run/viikko5/gunicorn.sock --umask 007 \
     --access-logfile - \
     app:app
