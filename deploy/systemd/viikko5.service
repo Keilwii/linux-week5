@@ -1,0 +1,34 @@
+[Unit]
+Description=Week 5 LLM chat (Flask + Gunicorn)
+After=network.target mariadb.service ollama.service
+Wants=mariadb.service ollama.service
+
+[Service]
+User=viikko5
+Group=viikko5
+WorkingDirectory=/opt/viikko5/app
+EnvironmentFile=/etc/viikko5/viikko5.env
+# systemd makes /run/viikko5 for the socket. Group viikko5 (nginx's www-data is
+# a member) can use the socket, nobody else can.
+RuntimeDirectory=viikko5
+RuntimeDirectoryMode=0750
+ExecStart=/opt/viikko5/venv/bin/gunicorn \
+    --workers 2 --worker-class gthread --threads 8 \
+    --timeout 300 \
+    --bind unix:/run/viikko5/gunicorn.sock --umask 007 \
+    --access-logfile - \
+    app:app
+Restart=on-failure
+RestartSec=3
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target
