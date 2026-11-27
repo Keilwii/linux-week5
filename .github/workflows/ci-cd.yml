@@ -18,9 +18,9 @@ jobs:
     name: Lint and tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.14"   # same as server A
           cache: pip
@@ -46,7 +46,7 @@ jobs:
     env:
       HOST: 46.62.229.94
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: SSH key and known_hosts from secrets
         env:
