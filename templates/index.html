@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Week 5 – Chat</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body data-base="{{ request.script_root }}">
+    <header>
+        <h1>Chat with a local model</h1>
+        <p>Week 5: CI/CD pipeline and a self-hosted LLM chat</p>
+        <p>
+            The model is <code>{{ model }}</code> and it runs with Ollama on this same Hetzner
+            server (dev-kalle). Nothing is sent to an outside AI service. It runs on the CPU,
+            so a reply takes a few seconds and the answers are not always smart.
+        </p>
+        <p>
+            <a href="{{ url_for('docs') }}">Documentation and test results</a> ·
+            <a href="https://github.com/Keilwii/linux-week5">GitHub repository</a> ·
+            <a href="https://github.com/Keilwii/linux-week5/actions">Actions</a>
+        </p>
+    </header>
+
+    <section>
+        <h2>Conversation</h2>
+        {% if db_error %}<p class="error">{{ db_error }}</p>{% endif %}
+        <div id="messages">
+            {% for m in history %}
+            <div class="msg {{ m.role }}"><span class="who">{{ 'You' if m.role == 'user' else 'Model' }}</span><p>{{ m.content }}</p></div>
+            {% endfor %}
+        </div>
+        <p id="empty" class="note"{% if history %} hidden{% endif %}>No messages yet. Say something.</p>
+
+        <form id="chat-form" autocomplete="off">
+            <textarea id="message" name="message" rows="3" maxlength="2000"
+                      placeholder="Write a message (Enter sends, Shift+Enter makes a new line)" required></textarea>
+            <button type="submit" id="send">Send</button>
+        </form>
+        <form method="post" action="{{ url_for('new_conversation') }}">
+            <button type="submit" class="secondary">Start a new conversation</button>
+        </form>
+        <p class="note">
+            The conversation is saved in MariaDB and tied to a cookie that lasts until you close the
+            browser. Reloading keeps it, another browser or a private window starts an empty one.
+        </p>
+    </section>
+
+    <footer class="note">Running commit <code>{{ revision[:7] }}</code>, <a href="{{ url_for('health') }}">health</a></footer>
+    <script src="{{ url_for('static', filename='chat.js') }}"></script>
+</body>
+</html>

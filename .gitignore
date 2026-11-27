@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+*.env
+REVISION
+.pytest_cache/
+.ruff_cache/
+# keys never go to git
+*_deploy
+*.pem
+id_rsa*
+id_ed25519*
